@@ -1,0 +1,147 @@
+package com.kylecorry.trail_sense.tools.map.ui
+
+import android.content.Context
+import android.graphics.Color
+import android.view.View
+import androidx.fragment.app.Fragment
+import com.kylecorry.andromeda.core.cache.DependencyRegistry
+import com.kylecorry.andromeda.fragments.inBackground
+import com.kylecorry.andromeda.geojson.GeoJsonFeature
+import com.kylecorry.andromeda.geojson.GeoJsonFeatureCollection
+import com.kylecorry.sol.science.geography.Geography
+import com.kylecorry.sol.units.Coordinate
+import com.kylecorry.sol.units.Distance
+import com.kylecorry.trail_sense.shared.extensions.point
+import com.kylecorry.trail_sense.shared.map_layers.preferences.repo.MapLayerPreferenceRepo
+import com.kylecorry.trail_sense.shared.map_layers.ui.layers.IMapView
+import com.kylecorry.trail_sense.shared.map_layers.ui.layers.geojson.ConfigurableGeoJsonLayer
+import com.kylecorry.trail_sense.shared.map_layers.ui.layers.getLayerById
+import com.kylecorry.trail_sense.shared.map_layers.ui.layers.setLayersWithPreferences
+import com.kylecorry.trail_sense.shared.map_layers.ui.layers.start
+import com.kylecorry.trail_sense.shared.map_layers.ui.layers.stop
+import com.kylecorry.trail_sense.shared.sharing.GeoJsonFeatureClickHandler
+import com.kylecorry.trail_sense.tools.map.MapToolRegistration
+import com.kylecorry.trail_sense.tools.map.map_layers.MyElevationLayer
+import com.kylecorry.trail_sense.tools.map.map_layers.ScaleBarLayer
+import com.kylecorry.trail_sense.tools.navigation.map_layers.CompassOverlayLayer
+import com.kylecorry.trail_sense.tools.offline_maps.ui.photo_maps.MapDistanceLayer
+import java.time.Instant
+
+class MapToolLayerManager {
+    private val selectedPointLayer = ConfigurableGeoJsonLayer()
+    private val distanceLayer = MapDistanceLayer()
+    private var onDistanceChangedCallback: ((Distance) -> Unit)? = null
+    private val repo = DependencyRegistry.get<MapLayerPreferenceRepo>()
+
+    var key: Int = 0
+
+    private var isRunning = false
+    private val runningLock = Any()
+
+    fun resume(context: Context, view: IMapView, fragment: Fragment) {
+        synchronized(runningLock) {
+            isRunning = true
+        }
+        fragment.inBackground {
+            view.setLayersWithPreferences(
+                MapToolRegistration.MAP_ID,
+                repo.getActiveLayerIds(MapToolRegistration.MAP_ID) +
+                        listOf(
+                            ScaleBarLayer.LAYER_ID,
+                            MyElevationLayer.LAYER_ID,
+                            CompassOverlayLayer.LAYER_ID,
+                        ),
+                listOf(
+
+                    selectedPointLayer,
+                    distanceLayer
+                )
+            )
+
+            // Hardcoded configuration
+            distanceLayer.onPathChanged = { onDistancePathChange(it) }
+            distanceLayer.isEnabled = false
+            (view.getLayerById(CompassOverlayLayer.LAYER_ID) as? CompassOverlayLayer)?.paddingTopDp =
+                48f
+
+            view.layerManager.setOnGeoJsonFeatureClickListener { feature ->
+                GeoJsonFeatureClickHandler.handleFeatureClick(fragment, feature)
+            }
+
+            synchronized(runningLock) {
+                if (isRunning) {
+                    view.start()
+
+                    if (view is View) {
+                        view.invalidate()
+                    }
+                }
+            }
+
+            key++
+        }
+    }
+
+    fun pause(view: IMapView) {
+        synchronized(runningLock) {
+            isRunning = false
+            view.stop()
+        }
+    }
+
+    fun onBoundsChanged() {
+        distanceLayer.invalidate()
+    }
+
+    fun setTime(view: IMapView, time: Instant?) {
+        view.layerManager.setTime(time)
+    }
+
+    fun setSelectedLocation(location: Coordinate?) {
+        if (location == null) {
+            selectedPointLayer.setData(GeoJsonFeatureCollection(emptyList()))
+        } else {
+            val point = GeoJsonFeature.point(
+                location,
+                strokeColor = Color.WHITE,
+                color = Color.BLACK
+            )
+            selectedPointLayer.setData(point)
+        }
+    }
+
+    // Distance measurement
+
+    private fun onDistancePathChange(points: List<Coordinate>) {
+        // Display distance
+        val distance = Geography.getPathDistance(points)
+        onDistanceChangedCallback?.invoke(distance)
+    }
+
+    fun setOnDistanceChangedCallback(callback: ((Distance) -> Unit)?) {
+        onDistanceChangedCallback = callback
+    }
+
+    fun stopDistanceMeasurement() {
+        distanceLayer.isEnabled = false
+        distanceLayer.clear()
+    }
+
+    fun undoLastDistanceMeasurement() {
+        distanceLayer.undo()
+    }
+
+    fun getDistanceMeasurementPoints(): List<Coordinate> {
+        return distanceLayer.getPoints()
+    }
+
+    fun startDistanceMeasurement(initialPoints: Array<Coordinate>) {
+        distanceLayer.isEnabled = true
+        distanceLayer.clear()
+        initialPoints.forEach { distanceLayer.add(it) }
+    }
+
+    fun isMeasuringDistance(): Boolean {
+        return distanceLayer.isEnabled
+    }
+}

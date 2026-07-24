@@ -1,0 +1,73 @@
+package com.kylecorry.trail_sense.tools.offline_maps.infrastructure.photo_maps.calibration
+
+import com.kylecorry.sol.math.trigonometry.Trigonometry
+import com.kylecorry.sol.science.geology.CoordinateBounds
+import com.kylecorry.trail_sense.shared.toVector2
+import com.kylecorry.trail_sense.tools.offline_maps.domain.OfflineMapState
+import com.kylecorry.trail_sense.tools.offline_maps.domain.photo_maps.projections.MapProjectionFactory
+import com.kylecorry.trail_sense.tools.offline_maps.domain.photo_maps.PhotoMap
+import kotlin.math.absoluteValue
+
+/**
+ * A class that calculates the rotation of a map based on the calibration points
+ */
+class MapRotationCalculator {
+
+    /**
+     * Calculates the ideal rotation of the map
+     * @param map: The map to calculate the rotation for
+     * @return The rotation in degrees
+     */
+    fun calculate(map: PhotoMap): Float {
+        if (map.state != OfflineMapState.Ready) {
+            return 0f
+        }
+
+
+        // If the map is large, only allow it to be flipped vertically
+        val bounds = CoordinateBounds.from(map.georeference.calibrationPoints.map { it.location })
+        val east = bounds.east
+        val west = bounds.west
+        if ((east - west).absoluteValue > 180) {
+            // Min and max are flipped because it is dealing with image coordinates from the top left
+            val top = map.georeference.calibrationPoints.minBy { it.imageLocation.y }.location
+            val bottom = map.georeference.calibrationPoints.maxBy { it.imageLocation.y }.location
+
+            if (top.latitude < bottom.latitude) {
+                return 180f
+            }
+
+            return 0f
+        }
+
+
+        val size = map.georeference.size
+        val pixels = map.georeference.calibrationPoints.map {
+            it.imageLocation.toPixels(
+                size.width,
+                size.height
+            ).toVector2(size.height)
+        }
+
+        val baseProjection = MapProjectionFactory().getProjection(map.georeference.projectionType)
+
+        val projectedPixels = map.georeference.calibrationPoints.map {
+            baseProjection.toPixels(it.location)
+        }
+
+        val pixelAngle = Trigonometry.remapUnitAngle(
+            pixels[0].angleBetween(pixels[1]),
+            90f,
+            false
+        )
+
+        val locationAngle = Trigonometry.remapUnitAngle(
+            projectedPixels[0].angleBetween(projectedPixels[1]),
+            90f,
+            false
+        )
+
+        return Trigonometry.normalizeAngle(Trigonometry.deltaAngle(pixelAngle, locationAngle))
+    }
+
+}

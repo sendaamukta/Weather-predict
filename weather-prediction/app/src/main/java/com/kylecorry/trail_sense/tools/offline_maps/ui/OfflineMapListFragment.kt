@@ -1,0 +1,461 @@
+package com.kylecorry.trail_sense.tools.offline_maps.ui
+
+import android.net.Uri
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.activity.OnBackPressedCallback
+import androidx.core.os.BundleCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.kylecorry.andromeda.alerts.Alerts
+import com.kylecorry.andromeda.alerts.loading.AlertLoadingIndicator
+import com.kylecorry.andromeda.alerts.toast
+import com.kylecorry.andromeda.core.coroutines.BackgroundMinimumState
+import com.kylecorry.andromeda.core.tryOrNothing
+import com.kylecorry.andromeda.fragments.BoundFragment
+import com.kylecorry.andromeda.fragments.inBackground
+import com.kylecorry.andromeda.fragments.onBackPressed
+import com.kylecorry.andromeda.pickers.Pickers
+import com.kylecorry.luna.concurrency.onDefault
+import com.kylecorry.luna.concurrency.onMain
+import com.kylecorry.trail_sense.R
+import com.kylecorry.trail_sense.databinding.FragmentOfflineMapListBinding
+import com.kylecorry.trail_sense.main.getAppService
+import com.kylecorry.trail_sense.shared.UserPreferences
+import com.kylecorry.trail_sense.shared.grouping.lists.GroupListManager
+import com.kylecorry.trail_sense.shared.grouping.lists.bind
+import com.kylecorry.trail_sense.shared.io.DeleteTempFilesCommand
+import com.kylecorry.trail_sense.shared.io.IntentUriPicker
+import com.kylecorry.trail_sense.shared.navigateWithAnimation
+import com.kylecorry.trail_sense.shared.sensors.SensorService
+import com.kylecorry.trail_sense.tools.guide.infrastructure.UserGuideUtils
+import com.kylecorry.trail_sense.tools.offline_maps.domain.OfflineMapCatalogItem
+import com.kylecorry.trail_sense.tools.offline_maps.domain.OfflineMapService
+import com.kylecorry.trail_sense.tools.offline_maps.domain.OfflineMapState
+import com.kylecorry.trail_sense.tools.offline_maps.domain.groups.MapGroup
+import com.kylecorry.trail_sense.tools.offline_maps.domain.groups.MapGroupLoader
+import com.kylecorry.trail_sense.tools.offline_maps.domain.photo_maps.PhotoMap
+import com.kylecorry.trail_sense.tools.offline_maps.domain.sort.ClosestMapSortStrategy
+import com.kylecorry.trail_sense.tools.offline_maps.domain.sort.MapSortMethod
+import com.kylecorry.trail_sense.tools.offline_maps.domain.sort.MostRecentMapSortStrategy
+import com.kylecorry.trail_sense.tools.offline_maps.domain.sort.NameMapSortStrategy
+import com.kylecorry.trail_sense.tools.offline_maps.domain.trail_maps.TrailMap
+import com.kylecorry.trail_sense.tools.offline_maps.infrastructure.photo_maps.commands.PrintMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.CreateMapGroupCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.DeleteMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.EditOfflineMapAttributionCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.MoveMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.RenameMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.ResizeMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.ShowMapsDisclaimerCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.ToggleVisibilityMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.create.CreateBlankMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.create.CreateMapFromCameraCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.create.CreateMapFromFileCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.create.CreateMapFromUriCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.commands.create.ICreateMapCommand
+import com.kylecorry.trail_sense.tools.offline_maps.ui.mappers.IMapMapper
+import com.kylecorry.trail_sense.tools.offline_maps.ui.mappers.MapAction
+import com.kylecorry.trail_sense.tools.offline_maps.ui.mappers.MapGroupAction
+import com.kylecorry.trail_sense.tools.offline_maps.ui.mappers.TrailMapAction
+import com.kylecorry.trail_sense.tools.offline_maps.ui.photo_maps.FragmentMapExportService
+
+class OfflineMapListFragment : BoundFragment<FragmentOfflineMapListBinding>() {
+
+    private val sensorService by lazy { SensorService(requireContext()) }
+    private val gps by lazy { sensorService.getGPS() }
+    private val prefs by lazy { UserPreferences(requireContext()) }
+    private val mapService by lazy { getAppService<OfflineMapService>() }
+    private val mapLoader by lazy { MapGroupLoader(mapService.loader) }
+    private lateinit var manager: GroupListManager<OfflineMapCatalogItem>
+    private lateinit var mapper: IMapMapper
+
+    private var sort = MapSortMethod.Closest
+
+    private var lastRoot: OfflineMapCatalogItem? = null
+    private var backPressedCallback: OnBackPressedCallback? = null
+
+    private val uriPicker by lazy { IntentUriPicker(this, requireContext()) }
+    private val mapImportingIndicator by lazy {
+        AlertLoadingIndicator(
+            requireContext(),
+            getString(R.string.importing_map)
+        )
+    }
+    private val exportService by lazy { FragmentMapExportService(this) }
+
+    override fun generateBinding(
+        layoutInflater: LayoutInflater,
+        container: ViewGroup?
+    ): FragmentOfflineMapListBinding {
+        return FragmentOfflineMapListBinding.inflate(layoutInflater, container, false)
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        manager = GroupListManager(
+            lifecycleScope,
+            mapLoader,
+            lastRoot,
+            this::sortMaps
+        )
+
+        mapper = IMapMapper(
+            gps,
+            requireContext(),
+            this,
+            this::onPhotoMapAction,
+            this::onTrailMapAction,
+            this::onMapGroupAction
+        )
+
+        val mapIntentUri =
+            BundleCompat.getParcelable(arguments ?: Bundle(), "map_intent_uri", Uri::class.java)
+        arguments?.remove("map_intent_uri")
+        if (mapIntentUri != null) {
+            createMap(
+                CreateMapFromUriCommand(
+                    requireContext(),
+                    mapIntentUri
+                )
+            )
+        }
+
+        ShowMapsDisclaimerCommand(this).execute()
+
+        binding.mapList.emptyView = binding.mapEmptyText
+
+        binding.mapListTitle.leftButton.setOnClickListener {
+            UserGuideUtils.showGuide(this, R.raw.guide_tool_offline_maps)
+        }
+
+        sort = prefs.photoMaps.mapSort
+        binding.mapListTitle.rightButton.setOnClickListener {
+            Pickers.menu(
+                it, listOf(
+                    getString(R.string.sort_by, getSortString(sort))
+                )
+            ) { selected ->
+                when (selected) {
+                    0 -> changeSort()
+                }
+                true
+            }
+        }
+
+        manager.bind(binding.searchbox)
+        manager.bind(binding.mapList, binding.mapListTitle.title, mapper) {
+            (it as MapGroup?)?.name ?: getString(R.string.offline_maps)
+        }
+
+        backPressedCallback = onBackPressed {
+            if (!manager.up()) {
+                remove()
+                findNavController().navigateUp()
+            }
+        }
+        updateBackPressedCallback()
+
+        setupMapCreateMenu()
+    }
+
+    override fun onHiddenChanged(hidden: Boolean) {
+        super.onHiddenChanged(hidden)
+        updateBackPressedCallback()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateBackPressedCallback()
+        manager.refresh()
+        inBackground {
+            val mapsDeleted = mapService.cleanup()
+            if (mapsDeleted) {
+                manager.refresh()
+            }
+        }
+    }
+
+    private fun changeSort() {
+        val sortOptions = MapSortMethod.values()
+        Pickers.item(
+            requireContext(),
+            getString(R.string.sort),
+            sortOptions.map { getSortString(it) },
+            sortOptions.indexOf(prefs.photoMaps.mapSort)
+        ) { newSort ->
+            if (newSort != null) {
+                prefs.photoMaps.mapSort = sortOptions[newSort]
+                sort = sortOptions[newSort]
+                onSortChanged()
+            }
+        }
+    }
+
+    private fun getSortString(sortMethod: MapSortMethod): String {
+        return when (sortMethod) {
+            MapSortMethod.MostRecent -> getString(R.string.most_recent)
+            MapSortMethod.Closest -> getString(R.string.closest)
+            MapSortMethod.Name -> getString(R.string.name)
+        }
+    }
+
+    private fun onSortChanged() {
+        manager.refresh(true)
+    }
+
+    private suspend fun sortMaps(maps: List<OfflineMapCatalogItem>): List<OfflineMapCatalogItem> = onDefault {
+        val strategy = when (sort) {
+            MapSortMethod.Closest -> ClosestMapSortStrategy(gps.location, mapService.loader)
+            MapSortMethod.MostRecent -> MostRecentMapSortStrategy(mapService.loader)
+            MapSortMethod.Name -> NameMapSortStrategy()
+        }
+
+        strategy.sort(maps)
+    }
+
+    private fun onMapGroupAction(group: MapGroup, action: MapGroupAction) {
+        when (action) {
+            MapGroupAction.View -> view(group)
+            MapGroupAction.Delete -> delete(group)
+            MapGroupAction.Rename -> rename(group)
+            MapGroupAction.Move -> move(group)
+            MapGroupAction.ShowAll -> setGroupVisibility(group, true)
+            MapGroupAction.HideAll -> setGroupVisibility(group, false)
+        }
+    }
+
+    private fun setGroupVisibility(group: MapGroup, visible: Boolean) {
+        inBackground {
+            Alerts.withLoading(requireContext(), getString(R.string.loading)) {
+                mapService.setVisible(group, visible)
+                onMain {
+                    manager.refresh()
+                }
+            }
+        }
+    }
+
+    private fun onPhotoMapAction(map: PhotoMap, action: MapAction) {
+        when (action) {
+            MapAction.View -> view(map)
+            MapAction.Delete -> delete(map)
+            MapAction.Export -> export(map)
+            MapAction.Print -> print(map)
+            MapAction.Resize -> resize(map)
+            MapAction.Rename -> rename(map)
+            MapAction.Move -> move(map)
+            MapAction.ToggleVisibility -> toggleVisibility(map)
+        }
+    }
+
+    private fun onTrailMapAction(map: TrailMap, action: TrailMapAction) {
+        when (action) {
+            TrailMapAction.View -> view(map)
+            TrailMapAction.Rename -> rename(map)
+            TrailMapAction.EditAttribution -> editAttribution(map)
+            TrailMapAction.Delete -> delete(map)
+            TrailMapAction.Move -> move(map)
+            TrailMapAction.ToggleVisibility -> toggleVisibility(map)
+            TrailMapAction.CopyToAppStorage -> copyToAppStorage(map)
+        }
+    }
+
+    private fun copyToAppStorage(map: TrailMap) {
+        inBackground {
+            mapImportingIndicator.show()
+            try {
+                mapService.copyToAppStorage(map)
+            } finally {
+                mapImportingIndicator.hide()
+            }
+            manager.refresh()
+        }
+    }
+
+    private fun resize(map: PhotoMap) {
+        inBackground {
+            ResizeMapCommand(requireContext(), mapImportingIndicator).execute(map)
+            manager.refresh()
+        }
+    }
+
+    private fun print(map: PhotoMap) {
+        inBackground(BackgroundMinimumState.Created) {
+            PrintMapCommand(requireContext()).execute(map)
+        }
+    }
+
+    private fun export(map: PhotoMap) {
+        exportService.export(map)
+    }
+
+    private fun rename(map: OfflineMapCatalogItem) {
+        inBackground {
+            RenameMapCommand(requireContext(), mapService).execute(map)
+            manager.refresh()
+        }
+    }
+
+    private fun editAttribution(map: TrailMap) {
+        inBackground {
+            EditOfflineMapAttributionCommand(requireContext()).execute(map)
+            manager.refresh()
+        }
+    }
+
+    private fun move(map: OfflineMapCatalogItem) {
+        inBackground {
+            MoveMapCommand(requireContext(), mapService).execute(map)
+            manager.refresh()
+        }
+    }
+
+    private fun toggleVisibility(map: OfflineMapCatalogItem) {
+        inBackground {
+            ToggleVisibilityMapCommand(mapService).execute(map)
+            manager.refresh()
+        }
+    }
+
+    private fun delete(map: OfflineMapCatalogItem) {
+        inBackground {
+            DeleteMapCommand(requireContext(), mapService).execute(map)
+            manager.refresh()
+        }
+    }
+
+    private fun view(map: OfflineMapCatalogItem) {
+        when (map) {
+            is MapGroup -> manager.open(map.id)
+            is PhotoMap -> findNavController().navigate(
+                R.id.action_mapList_to_maps,
+                Bundle().apply {
+                    putLong("mapId", map.id)
+                }
+            )
+
+            is TrailMap -> {
+                if (map.state == OfflineMapState.Draft) {
+                    Alerts.dialog(
+                        requireContext(),
+                        getString(R.string.invalid_trail_map),
+                        getString(R.string.invalid_trail_map_message),
+                        cancelText = null
+                    )
+                    return
+                }
+
+                findNavController().navigateWithAnimation(
+                    R.id.offlineMapViewFragment,
+                    Bundle().apply {
+                        putLong("offline_map_file_id", map.id)
+                    }
+                )
+            }
+        }
+    }
+
+    private fun setupMapCreateMenu() {
+        binding.addMenu.setOverlay(binding.overlayMask)
+        binding.addMenu.fab = binding.addBtn
+        binding.addMenu.hideOnMenuOptionSelected = true
+        binding.addMenu.setOnMenuItemClickListener { menuItem ->
+            when (menuItem.itemId) {
+                R.id.action_import_map_file -> {
+                    createMap(
+                        CreateMapFromFileCommand(
+                            requireContext(),
+                            uriPicker
+                        )
+                    )
+                }
+
+                R.id.action_import_map_camera -> {
+                    createMap(
+                        CreateMapFromCameraCommand(this)
+                    )
+                }
+
+                R.id.action_create_map_group -> {
+                    createMapGroup()
+                }
+
+                R.id.action_create_blank_map -> {
+                    createMap(
+                        CreateBlankMapCommand(requireContext())
+                    )
+                }
+            }
+            true
+        }
+    }
+
+    private fun createMapGroup() {
+        inBackground {
+            CreateMapGroupCommand(requireContext(), mapService).execute(manager.root?.id)
+            manager.refresh()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        tryOrNothing {
+            lastRoot = manager.root
+        }
+    }
+
+    private fun updateBackPressedCallback() {
+        backPressedCallback?.isEnabled = !isHidden
+    }
+
+    private fun createMap(command: ICreateMapCommand) {
+        inBackground(BackgroundMinimumState.Created) {
+            try {
+                binding.addBtn.isEnabled = false
+
+                val request = command.execute()?.copy(parentId = manager.root?.id)
+
+                if (request == null) {
+                    toast(getString(R.string.error_importing_map))
+                    return@inBackground
+                }
+
+                mapImportingIndicator.show()
+                val result = try {
+                    mapService.createMap(request)
+                } finally {
+                    mapImportingIndicator.hide()
+                }
+
+                if (result == null) {
+                    toast(getString(R.string.error_importing_map))
+                    return@inBackground
+                }
+
+                if (result.autoCalibrated) {
+                    toast(getString(R.string.map_auto_calibrated))
+                }
+
+                manager.refresh(true)
+                when (val map = result.map) {
+                    is PhotoMap -> findNavController().navigate(
+                        R.id.action_mapList_to_maps,
+                        Bundle().apply {
+                            putLong("mapId", map.id)
+                        }
+                    )
+                }
+            } finally {
+                binding.addBtn.isEnabled = true
+                DeleteTempFilesCommand(requireContext()).execute()
+            }
+
+        }
+    }
+
+
+}

@@ -1,0 +1,134 @@
+package com.kylecorry.trail_sense.tools.offline_maps.domain.photo_maps.projections
+
+import com.kylecorry.andromeda.core.units.PixelCoordinate
+import com.kylecorry.sol.math.Vector2
+import com.kylecorry.sol.math.arithmetic.Arithmetic
+import com.kylecorry.sol.math.interpolation.Interpolation.map
+import com.kylecorry.sol.math.interpolation.Interpolation.norm
+import com.kylecorry.sol.science.geography.projections.IMapProjection
+import com.kylecorry.sol.science.geology.CoordinateBounds
+import com.kylecorry.sol.units.Coordinate
+
+class CalibratedProjection(
+    calibration: List<Pair<PixelCoordinate, Coordinate>>,
+    private val projection: IMapProjection
+) : IMapProjection {
+
+    private val left = getLeft(calibration)
+    private val right = getRight(calibration)
+    private val top = getTop(calibration)
+    private val bottom = getBottom(calibration)
+    private val width = (right?.first?.x ?: 0f) - (left?.first?.x ?: 0f)
+    private val height = (bottom?.first?.y ?: 0f) - (top?.first?.y ?: 0f)
+    private val bounds = getBounds(calibration.map { it.second })
+
+    private val bottomLeft = projection.toPixels(bounds.south, bounds.west)
+    private val topRight = projection.toPixels(bounds.north, bounds.east)
+
+
+    override fun toCoordinate(pixel: Vector2): Coordinate {
+        val hasZeroSize = Arithmetic.isZero(width) || Arithmetic.isZero(height)
+        val hasInvalidCorner = left == null || top == null
+
+        if (hasInvalidCorner || hasZeroSize) {
+            return Coordinate.zero
+        }
+
+        val x = map(
+            (pixel.x - left.first.x).toDouble() / width.toDouble(),
+            0.0,
+            1.0,
+            bottomLeft.x.toDouble(),
+            topRight.x.toDouble()
+        )
+        val y = map(
+            (pixel.y - top.first.y - height).toDouble() / -height.toDouble(),
+            0.0,
+            1.0,
+            bottomLeft.y.toDouble(),
+            topRight.y.toDouble()
+        )
+
+        return projection.toCoordinate(Vector2(x.toFloat(), y.toFloat()))
+    }
+
+    override fun toPixels(location: Coordinate): Vector2 {
+        return toPixels(location.latitude, location.longitude)
+    }
+
+    override fun toPixels(
+        latitude: Double,
+        longitude: Double
+    ): Vector2 {
+        val hasZeroSize = Arithmetic.isZero(width) || Arithmetic.isZero(height)
+        val hasInvalidCorner = left == null || top == null || bottom == null
+
+        if (hasInvalidCorner || hasZeroSize) {
+            return Vector2(0f, 0f)
+        }
+
+        val coords = if (longitude < 0 && bounds.west > 0) {
+            projection.toPixels(latitude, longitude + 360)
+        } else {
+            projection.toPixels(latitude, longitude)
+        }
+
+        val x = left.first.x.toDouble() + width.toDouble() * norm(
+            coords.x.toDouble(),
+            bottomLeft.x.toDouble(),
+            topRight.x.toDouble()
+        )
+        val y = top.first.y.toDouble() + height.toDouble() - height.toDouble() * norm(
+            coords.y.toDouble(),
+            bottomLeft.y.toDouble(),
+            topRight.y.toDouble()
+        )
+        return Vector2(x.toFloat(), y.toFloat())
+    }
+
+    private fun getLeft(pixels: List<Pair<PixelCoordinate, Coordinate>>): Pair<PixelCoordinate, Coordinate>? {
+        return pixels.minByOrNull { it.first.x }
+    }
+
+    private fun getRight(pixels: List<Pair<PixelCoordinate, Coordinate>>): Pair<PixelCoordinate, Coordinate>? {
+        return pixels.maxByOrNull { it.first.x }
+    }
+
+    private fun getTop(pixels: List<Pair<PixelCoordinate, Coordinate>>): Pair<PixelCoordinate, Coordinate>? {
+        return pixels.minByOrNull { it.first.y }
+    }
+
+    private fun getBottom(pixels: List<Pair<PixelCoordinate, Coordinate>>): Pair<PixelCoordinate, Coordinate>? {
+        return pixels.maxByOrNull { it.first.y }
+    }
+
+    private fun getBounds(coordinates: List<Coordinate>): CoordinateBounds {
+        var bounds = CoordinateBounds.from(coordinates)
+
+        val minLongitude = coordinates.minByOrNull { it.longitude }?.longitude
+        val maxLongitude = coordinates.maxByOrNull { it.longitude }?.longitude
+
+        // TODO: Move this into the coordinate bounds class
+        if (minLongitude == -180.0 && maxLongitude == 180.0) {
+            bounds = CoordinateBounds(bounds.north, 180.0, bounds.south, -180.0)
+        }
+
+        // TODO: Map projection does not work at the poles - move this into the mercator projection class
+        if (bounds.north == 90.0) {
+            bounds = CoordinateBounds(89.9999, bounds.east, bounds.south, bounds.west)
+        }
+
+        if (bounds.south == -90.0) {
+            bounds = CoordinateBounds(bounds.north, bounds.east, -89.9999, bounds.west)
+        }
+
+        // TODO: This should be moved into the mercator projection class
+        if (bounds.east < 0 && bounds.west > 0) {
+            bounds =
+                CoordinateBounds(bounds.north, bounds.east + 360, bounds.south, bounds.west)
+        }
+
+        return bounds
+    }
+
+}

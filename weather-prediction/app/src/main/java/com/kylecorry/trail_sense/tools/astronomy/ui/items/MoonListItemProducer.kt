@@ -1,0 +1,80 @@
+package com.kylecorry.trail_sense.tools.astronomy.ui.items
+
+import android.content.Context
+import androidx.core.graphics.drawable.toDrawable
+import com.kylecorry.andromeda.views.list.DrawableListIcon
+import com.kylecorry.andromeda.views.list.ListItem
+import com.kylecorry.luna.concurrency.onDefault
+import com.kylecorry.sol.units.Coordinate
+import com.kylecorry.trail_sense.R
+import com.kylecorry.trail_sense.shared.declination.DeclinationUtils
+import com.kylecorry.trail_sense.tools.astronomy.ui.MoonPhaseImageMapper
+import java.time.LocalDate
+import java.time.ZoneId
+
+class MoonListItemProducer(context: Context) : BaseAstroListItemProducer(context) {
+
+    override suspend fun getListItem(
+        date: LocalDate,
+        location: Coordinate,
+        declination: Float
+    ): ListItem = onDefault {
+        // At a glance
+        val times = astronomyService.getMoonTimes(location, date)
+        val phase = if (date == LocalDate.now()) {
+            astronomyService.getCurrentMoonPhase()
+        } else {
+            astronomyService.getMoonPhase(date)
+        }
+        val tilt = if (date == LocalDate.now()) {
+            astronomyService.getMoonTilt(location)
+        } else {
+            astronomyService.getMoonTilt(
+                location,
+                date.atTime(12, 0).atZone(ZoneId.systemDefault()),
+                useNearestTransit = true
+            )
+        }
+
+        // Advanced
+        val isSuperMoon = astronomyService.isSuperMoon(date)
+        val peak = times.transit?.let { astronomyService.getMoonPosition(location, it).altitude }
+        val currentPosition = if (date == LocalDate.now()) astronomyService.getMoonPosition(location) else null
+        val azimuth = currentPosition?.let {
+            DeclinationUtils.fromTrueNorthBearing(it.azimuth, declination)
+        }
+        val altitude = currentPosition?.altitude
+        list(
+            2,
+            context.getString(R.string.moon),
+            percent(formatter.formatMoonPhase(phase.phase), phase.illumination),
+            DrawableListIcon(
+                MoonPhaseImageMapper(context).getPhaseImage(
+                    phase.phaseAngle,
+                    imageSize,
+                    imageSize,
+                    tilt
+                ).toDrawable(context.resources)
+            ),
+            data = riseSetTransit(times)
+        ) {
+            val advancedData = listOf(
+                context.getString(R.string.times) to riseSetTransit(times),
+                context.getString(R.string.moon_phase) to data(formatter.formatMoonPhase(phase.phase)),
+                context.getString(R.string.illumination) to percent(phase.illumination),
+                context.getString(R.string.astronomy_altitude_peak) to peak?.let { degrees(it) },
+                context.getString(R.string.supermoon) to data(
+                    formatter.formatBooleanYesNo(
+                        isSuperMoon
+                    )
+                ),
+                context.getString(R.string.astronomy_altitude) to altitude?.let { degrees(it) },
+                context.getString(R.string.direction) to azimuth?.let { degrees(it.value) }
+            )
+
+            showAdvancedData(context.getString(R.string.moon), advancedData)
+        }
+    }
+
+
+}
